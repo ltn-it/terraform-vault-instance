@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import base64
 import contextlib
 import hashlib
 import json
@@ -75,6 +74,10 @@ SECRET_PATH_MARKER = "secrets"
 SAFE_TERRAFORM_SECRET_MODULE_PATTERN = re.compile(
     r"[a-z0-9][a-z0-9_]*_secrets\.tf"
 )
+SAFE_PUBLIC_SECRET_ROUTE_PATTERN = re.compile(
+    r"(?:en/)?[a-z0-9]+(?:-[a-z0-9]+)*-secrets-"
+    r"[a-z0-9]+(?:-[a-z0-9]+)*\.html"
+)
 SECRET_CONTENT_PATTERNS = (
     re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
     re.compile(
@@ -114,7 +117,7 @@ AUTHORITATIVE_BASE_REFS = {
     "refs/remotes/origin/main": "main",
 }
 INTEGRATION_DIRECTORY_PREFIX = ".lit-integration-"
-COPILOT_DEVTOOL_IMAGE = "quay.io/l-it/ee-wunder-devtools-ubi9:v1.13.0@sha256:d65d9f849e2e18827d37277d25d9c62f6525c5f9a075feee977b9b0d02ec74c9"
+COPILOT_DEVTOOL_IMAGE = "quay.io/l-it/ee-wunder-devtools-ubi9:v1.16.1@sha256:c5e8707e825fcddb3e7bbc7592ebdc99a02e6ba9fa2cad71b88bcd5c71bd4d08"
 CHECK_PROFILE = {
     "name": "repository-quality-profile",
     "command": ["scripts/lit-ci-profile.sh", "repository-quality"],
@@ -200,7 +203,7 @@ class PlannedChange(NamedTuple):
 
 
 def is_secret_like_path(path: str) -> bool:
-    """Reject secret markers except in Terraform source-module filenames."""
+    """Reject secret markers except narrow reviewed source-file patterns."""
     lowered = path.lower()
     if any(fragment in lowered for fragment in SECRET_PATH_FRAGMENTS):
         return True
@@ -211,6 +214,11 @@ def is_secret_like_path(path: str) -> bool:
         if (
             index == len(components) - 1
             and SAFE_TERRAFORM_SECRET_MODULE_PATTERN.fullmatch(component)
+        ):
+            continue
+        if (
+            index == len(components) - 1
+            and SAFE_PUBLIC_SECRET_ROUTE_PATTERN.fullmatch(lowered)
         ):
             continue
         return True
@@ -271,6 +279,27 @@ GIT_IDENTITY_ENVIRONMENT = frozenset(
         "GIT_COMMITTER_NAME",
         "GIT_COMMITTER_EMAIL",
         "GIT_COMMITTER_DATE",
+    }
+)
+HTTPS_FETCH_ENVIRONMENT_ALLOWLIST = frozenset(
+    {
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "LOGNAME",
+        "PATH",
+        "SSL_CERT_DIR",
+        "SSL_CERT_FILE",
+        "TMPDIR",
+        "USER",
+        "XDG_CONFIG_HOME",
+        "GH_CONFIG_DIR",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
     }
 )
 
@@ -628,37 +657,27 @@ def current_branch_ref() -> str:
     return branch
 
 
-def github_https_authorization() -> str:
-    """Return a masked-process-safe GitHub Authorization header value."""
-    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
-    if token is None:
+def fetch_authoritative_base(branch: str, base_ref: str) -> subprocess.CompletedProcess[str]:
+    """Fetch one governed base branch through the local GitHub helper."""
+    credential_free_environment = {
+        name: value
+        for name, value in isolated_git_environment().items()
+        if name in HTTPS_FETCH_ENVIRONMENT_ALLOWLIST or name.startswith("GIT_")
+    }
+
+    def read_remote_url(*arguments: str) -> str:
         result = run(
-            ["gh", "auth", "token", "--hostname", "github.com"],
+            ["git", "remote", "get-url", *arguments],
             capture=True,
             timeout=30,
+            env=credential_free_environment,
         )
         if result.returncode:
-            raise RuntimeError(
-                "GitHub HTTPS origin requires GH_TOKEN, GITHUB_TOKEN, or "
-                "an authenticated gh session"
-            )
-        token = result.stdout.strip()
-    if (
-        not token
-        or len(token) > 4096
-        or any(ord(character) < 32 or ord(character) == 127 for character in token)
-    ):
-        raise RuntimeError("GitHub HTTPS authentication token is invalid")
-    credentials = base64.b64encode(
-        f"x-access-token:{token}".encode("utf-8")
-    ).decode("ascii")
-    return f"AUTHORIZATION: basic {credentials}"
+            raise RuntimeError("cannot inspect governed origin URL")
+        return result.stdout.strip()
 
-
-def fetch_authoritative_base(branch: str, base_ref: str) -> subprocess.CompletedProcess[str]:
-    """Fetch one governed base branch without exposing credentials on argv."""
-    origin_url = git_output("remote", "get-url", "origin").strip()
-    push_url = git_output("remote", "get-url", "--push", "origin").strip()
+    origin_url = read_remote_url("origin")
+    push_url = read_remote_url("--push", "origin")
     fetch_remote = governed_push_remote_from_url("origin", origin_url)
     push_remote = governed_push_remote_from_url("origin", push_url)
     if fetch_remote["repository"] != push_remote["repository"]:
@@ -674,18 +693,24 @@ def fetch_authoritative_base(branch: str, base_ref: str) -> subprocess.Completed
         f"+refs/heads/{branch}:{base_ref}",
     ]
     if not origin_url.startswith("https://github.com/"):
-        return run(command, capture=True, timeout=120)
-    environment = isolated_git_environment()
-    environment.update(
+        ssh_environment = dict(credential_free_environment)
+        if "SSH_AUTH_SOCK" in os.environ:
+            ssh_environment["SSH_AUTH_SOCK"] = os.environ["SSH_AUTH_SOCK"]
+        return run(command, capture=True, timeout=120, env=ssh_environment)
+    # A credential helper may supply the existing local GitHub credential on
+    # demand. The fetch process itself must not inherit provider tokens.
+    credential_free_environment.update(
         {
-            "GIT_CONFIG_COUNT": "2",
-            # Preserve the distributed engine's existing header slot while
-            # adding the container-safe workspace binding. Several managed
-            # repositories validate this credential-placement contract.
-            "GIT_CONFIG_KEY_0": "http.https://github.com/.extraheader",
-            "GIT_CONFIG_VALUE_0": github_https_authorization(),
-            "GIT_CONFIG_KEY_1": "safe.directory",
-            "GIT_CONFIG_VALUE_1": str(ROOT),
+            "GIT_CONFIG_COUNT": "3",
+            # Let Git request the existing local credential only when the
+            # governed HTTPS fetch needs it. An empty helper resets any
+            # repository-local helper list before the governed helper is added.
+            "GIT_CONFIG_KEY_0": "credential.helper",
+            "GIT_CONFIG_VALUE_0": "",
+            "GIT_CONFIG_KEY_1": "credential.helper",
+            "GIT_CONFIG_VALUE_1": "!gh auth git-credential",
+            "GIT_CONFIG_KEY_2": "safe.directory",
+            "GIT_CONFIG_VALUE_2": str(ROOT),
         }
     )
     return subprocess.run(
@@ -698,7 +723,7 @@ def fetch_authoritative_base(branch: str, base_ref: str) -> subprocess.Completed
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         timeout=120,
-        env=environment,
+        env=credential_free_environment,
     )
 
 
@@ -998,6 +1023,19 @@ def minimal_check_environment(state_root: Path) -> dict[str, str]:
                 "WUNDER_CONTAINER_ENGINE must be docker or podman when set"
             )
         environment["WUNDER_CONTAINER_ENGINE"] = selected_engine
+    configured_container_host = os.environ.get("CONTAINER_HOST")
+    if configured_container_host:
+        if not configured_container_host.startswith("unix://"):
+            raise RuntimeError(
+                "deterministic checks refuse a non-local CONTAINER_HOST"
+            )
+        container_socket = existing_unix_socket(configured_container_host)
+        if not container_socket:
+            raise RuntimeError(
+                "deterministic checks require the configured local "
+                "CONTAINER_HOST socket"
+            )
+        environment["CONTAINER_HOST"] = f"unix://{container_socket}"
     configured_host = os.environ.get("DOCKER_HOST")
     if configured_host and not configured_host.startswith("unix://"):
         raise RuntimeError(
@@ -1148,26 +1186,132 @@ def expected_integration_tree(change: PlannedChange) -> str:
                     "could not refresh the compatibility merge worktree "
                     "index: " + refreshed.stdout.strip()
                 )
+            merge_command = [
+                "git",
+                "-c",
+                f"core.hooksPath={disabled_hooks}",
+                "-c",
+                "merge.autoStash=false",
+                "-c",
+                "user.name=Lightning IT push-ready",
+                "-c",
+                "user.email=push-ready@invalid",
+                "merge",
+                "--no-commit",
+                "--no-ff",
+                "--strategy=ort",
+                change.head_commit,
+            ]
             merged = run(
-                [
-                    "git",
-                    "-c",
-                    f"core.hooksPath={disabled_hooks}",
-                    "-c",
-                    "merge.autoStash=false",
-                    "-c",
-                    "user.name=Lightning IT push-ready",
-                    "-c",
-                    "user.email=push-ready@invalid",
-                    "merge",
-                    "--no-commit",
-                    "--no-ff",
-                    "--strategy=ort",
-                    change.head_commit,
-                ],
+                merge_command,
                 capture=True,
                 cwd=worktree,
             )
+            merge_output_lines = merged.stdout.splitlines()
+            if (
+                merged.returncode
+                and merge_output_lines
+                and merge_output_lines[0].strip() == "fatal: stash failed"
+            ):
+                merge_head = run(
+                    ["git", "rev-parse", "--verify", "--quiet", "MERGE_HEAD"],
+                    capture=True,
+                    cwd=worktree,
+                )
+                current_head = git_output_at(worktree, "rev-parse", "HEAD").strip()
+                if (
+                    merge_head.returncode == 1
+                    and current_head == change.base_tip
+                    and directory_identity(
+                        worktree,
+                        purpose="compatibility merge worktree",
+                    )
+                    == worktree_identity
+                ):
+                    staged_drift = run(
+                        [
+                            "git",
+                            "diff",
+                            "--cached",
+                            "--quiet",
+                            "--no-ext-diff",
+                            "--no-textconv",
+                            change.base_tip,
+                            "--",
+                        ],
+                        capture=True,
+                        cwd=worktree,
+                    )
+                    tracked_drift = run(
+                        [
+                            "git",
+                            "diff",
+                            "--quiet",
+                            "--no-ext-diff",
+                            "--no-textconv",
+                            "--",
+                        ],
+                        capture=True,
+                        cwd=worktree,
+                    )
+                    untracked_drift = git_output_at(
+                        worktree,
+                        "ls-files",
+                        "--others",
+                        "--exclude-standard",
+                        "-z",
+                    )
+                    pre_rewrite_clean = (
+                        staged_drift.returncode == 0
+                        and tracked_drift.returncode == 0
+                        and not untracked_drift
+                    )
+                    if pre_rewrite_clean:
+                        # A newly checked-out linked-worktree index can remain
+                        # racily clean for the filesystem's one-second Git
+                        # timestamp window.  A normal refresh can leave the
+                        # index file untouched and make the single recovery
+                        # merge fail identically.
+                        # Wait past the window only after all three drift
+                        # proofs pass, then force Git to restat every index
+                        # entry and rewrite the Git 2.34-compatible index
+                        # format version 2.  This preserves every index entry
+                        # while moving the index timestamp beyond the
+                        # racy-clean window.  Re-prove status before the one
+                        # permitted retry.
+                        time.sleep(1.1)
+                        rewritten = run(
+                            [
+                                "git",
+                                "-c",
+                                f"core.hooksPath={disabled_hooks}",
+                                "update-index",
+                                "--really-refresh",
+                                "--index-version",
+                                "2",
+                            ],
+                            capture=True,
+                            cwd=worktree,
+                        )
+                        if rewritten.returncode:
+                            raise RuntimeError(
+                                "could not rewrite the compatibility merge "
+                                "worktree index after a transient stash race: "
+                                + rewritten.stdout.strip()
+                            )
+                        status_value = git_output_at(
+                            worktree,
+                            "status",
+                            "--porcelain=v1",
+                            "--untracked-files=all",
+                            "-z",
+                        )
+                        if not status_value:
+                            merged = run(
+                                merge_command,
+                                capture=True,
+                                cwd=worktree,
+                            )
             if merged.returncode:
                 raise RuntimeError(
                     "the reviewed HEAD does not merge cleanly with the "
@@ -1326,14 +1470,15 @@ def require_trusted_check_policy(
             )
 
 
-def integration_worktree_fingerprint(
-    cwd: Path, *, include_ignored: bool = False
-) -> str:
-    untracked_command = ["ls-files", "--others"]
-    if not include_ignored:
-        untracked_command.append("--exclude-standard")
-    untracked_command.append("-z")
-    untracked = git_output_at(cwd, *untracked_command).split("\0")
+def integration_worktree_fingerprint(cwd: Path) -> str:
+    # Deliberately omit --exclude-standard: deterministic validation must not
+    # be able to hide checkout mutations behind a repository ignore rule.
+    untracked = git_output_at(
+        cwd,
+        "ls-files",
+        "--others",
+        "-z",
+    ).split("\0")
     untracked_hashes: dict[str, str] = {}
     untracked_bytes = 0
     for name in (entry for entry in untracked if entry):
@@ -2423,7 +2568,7 @@ def checkout_sanitized_commit(
             "could not fetch sanitized review commit: " + fetched.stdout.strip()
         )
     checked_out = run(
-        ["git", "checkout", "-q", "--detach", "FETCH_HEAD"],
+        ["git", "checkout", "-q", "--detach", commit],
         capture=True,
         cwd=destination,
     )

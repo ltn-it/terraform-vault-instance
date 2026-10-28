@@ -17,6 +17,7 @@ jobs:
   terraform-module:
     name: Terraform module checks (Terraform ${{ matrix.terraform_version }})
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     strategy:
       fail-fast: false
@@ -68,6 +69,7 @@ jobs:
   release:
     name: Semantic Release
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     needs: terraform-module
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     permissions:
@@ -89,7 +91,7 @@ jobs:
         # v7.0.0
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
-          node-version: '24.19.0'
+          node-version: '24.22.1'
           cache: 'npm'
 
       # Install Node dependencies from package-lock.json
@@ -104,6 +106,7 @@ jobs:
   release_dry_run:
     name: Semantic Release (dry run)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: terraform-module
     if: github.event_name == 'pull_request'
     permissions:
@@ -124,7 +127,7 @@ jobs:
         # v7.0.0
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
-          node-version: '24.19.0'
+          node-version: '24.22.1'
           cache: 'npm'
 
       # Install Node dependencies from package-lock.json
