@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "repository": "ltn-it/terraform-vault-instance",
+  "mode": "reference",
+  "quality": [
+    {
+      "workflow": ".github/workflows/repository-quality.yml",
+      "job": "repository / quality"
+    },
+    {
+      "workflow": ".github/workflows/release.yml",
+      "job": "Terraform module checks (Terraform 1.12.1)"
+    }
+  ],
+  "accepted_sources": [],
+  "distribution_sources": [],
+  "artifact_publication": false
+}
