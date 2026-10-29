@@ -122,9 +122,19 @@ See [GitHub Releases](../../releases), [RELEASE.md](./RELEASE.md), and [TESTING.
 
 Terraform manages AppRole configuration and Role IDs. Ansible `vault_config`
 manages the complete KV v2 credential entry and creates Secret IDs outside
-Terraform. Before adopting this version, deploy the matching Ansible credential
-management change from Supplementary PR #1267's successor. Standalone Terraform
-consumers must provide their own KV credential writer before upgrading.
+Terraform. Use the matching Ansible credential management merged in
+[Supplementary PR #1268](https://github.com/ltn-it/ansible-collection-supplementary/pull/1268).
+Perform the handoff in this order:
+
+1. Install the matching Ansible collection with
+   `vault_config_manage_approle_credentials: false` (the default).
+2. Review and apply this Terraform version's plan to forget the legacy
+   credential resources without deleting their live KV entries.
+3. Set `vault_config_manage_approle_credentials: true` and run Ansible
+   `vault_config` to enable credential reconciliation and Secret ID management.
+
+Standalone Terraform consumers must provide their own KV credential writer
+before upgrading.
 
 The `removed` block for `vault_kv_secret_v2.approle_credentials` forgets all old
 instances without deleting their live KV entries (`destroy = false`). Review the
