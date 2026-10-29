@@ -117,3 +117,32 @@ The evidence records:
 - security scan status
 
 See [GitHub Releases](../../releases), [RELEASE.md](./RELEASE.md), and [TESTING.md](./TESTING.md) for the release process and validation model.
+
+## AppRole credential ownership migration
+
+Terraform manages AppRole configuration and Role IDs. Ansible `vault_config`
+manages the complete KV v2 credential entry and creates Secret IDs outside
+Terraform. Use the matching Ansible credential management merged in
+[Supplementary PR #1268](https://github.com/ltn-it/ansible-collection-supplementary/pull/1268).
+Perform the handoff in this order:
+
+1. Install the matching Ansible collection with
+   `vault_config_manage_approle_credentials: false` (the default).
+2. Review and apply this Terraform version's plan to forget the legacy
+   credential resources without deleting their live KV entries.
+3. Set `vault_config_manage_approle_credentials: true` and run Ansible
+   `vault_config` to enable credential reconciliation and Secret ID management.
+
+Standalone Terraform consumers must provide their own KV credential writer
+before upgrading.
+
+The `removed` block for `vault_kv_secret_v2.approle_credentials` forgets all old
+instances without deleting their live KV entries (`destroy = false`). Review the
+plan for the forget action before applying. This is supported by the existing
+Terraform minimum version 1.12.1. The module no longer creates, reads or overwrites
+credential KV entries, including on later refreshes. Old state versions and
+backups remain unchanged; operators must retire historical copies and rotate
+previously exposed credentials under their retention policy. Rollback to an old
+module version can resume credential management and must be coordinated.
+
+See the [Terraform removed-block reference](https://developer.hashicorp.com/terraform/language/block/removed).

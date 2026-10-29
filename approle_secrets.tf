@@ -18,20 +18,12 @@ resource "vault_approle_auth_backend_role" "cluster" {
   ]
 }
 
-# KV Secrets mit role_id
-resource "vault_kv_secret_v2" "approle_credentials" {
-  for_each = var.bootstrap_phase >= 3 ? local.active.approles : {}
+# Ansible owns the complete KV v2 credential entry, including the Secret ID.
+# Forget every legacy instance without deleting the live credentials.
+removed {
+  from = vault_kv_secret_v2.approle_credentials
 
-  mount     = each.value.kv_mount
-  name      = each.value.credential_path
-  namespace = each.value.namespace
-
-  # Dynamische Werte (role_id) werden hier referenziert
-  data_json = jsonencode({
-    role_id = vault_approle_auth_backend_role.cluster[each.key].role_id
-  })
-
-  depends_on = [
-    vault_mount.secret
-  ]
+  lifecycle {
+    destroy = false
+  }
 }
